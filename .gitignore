@@ -1,0 +1,17 @@
+# 钥匙文件 —— 绝不入库
+secrets.json
+*.secrets.json
+
+# 日志
+*.log
+*.log.*
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
