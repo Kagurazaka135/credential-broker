@@ -8,10 +8,11 @@
  * 走本地凭证代理，key 是假 key `local-broker` —— **本文件里没有任何真 key**。
  * 换模型只改 MODEL：
  *   deepseek-flash / deepseek-v4-pro        → DeepSeek
- *   glm-5.3                                 → 阿里百炼
+ *   mimo-v2.6-flash                         → 小米 MiMo（直连）
  *   or/openai/gpt-4o-mini                   → OpenRouter（测各家走 or/ 前缀）
  *   or/google/gemini-2.5-pro
  *   or/anthropic/claude-opus-4.7
+ *   or/z-ai/glm-5.3@zai                     → GLM（OR，@zai 钉智谱官方）
  */
 const http = require('http');
 

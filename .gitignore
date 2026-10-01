@@ -2,9 +2,11 @@
 secrets.json
 *.secrets.json
 
-# 日志
+# 日志 / 用量记录
 *.log
 *.log.*
+usage-*.jsonl
+usage-*.jsonl.*
 
 # Node
 node_modules/

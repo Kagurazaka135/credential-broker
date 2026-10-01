@@ -45,7 +45,9 @@ API key 散落在各处——项目配置、代理脚本、测试脚本、shell 
 - **零协议转换**：上游原生支持 Anthropic 与 OpenAI 两套端点，broker 只做「按路径分流」，不做格式翻译
   → **不破坏 prompt caching**（这对 Claude Code 这类长会话工具是刚需）
 - **一个端口说两种格式**：`/v1/messages`（Anthropic）与 `/v1/chat/completions`（OpenAI）
-- **按模型名路由**：不同前缀走不同上游
+- **按模型名路由**：不同前缀走不同上游（DeepSeek / 小米 MiMo / OpenRouter）
+- **钉供给方**：`or/` 路由可加 `@tag` 后缀，把同一个模型钉到指定供应商（`allow_fallbacks:false`，钉不住就报错，绝不偷偷换一家）
+- **用量记账**：每个完成的转发追加一行 JSON（模型 / 输入 / 输出 / 缓存 token），可用自带脚本汇总——**只记数字与模型名，不记内容**
 - **降级不崩**：读不到钥匙文件 → 记 WARN + 透传，进程不死
 - **加钥匙免重启**：钥匙文件改动 **10 秒内自动重读**
 - **日志不含敏感信息**：从不记录请求体 / 响应体 / 请求头
@@ -64,7 +66,7 @@ API key 散落在各处——项目配置、代理脚本、测试脚本、shell 
   "accept_token": "local-broker",
   "upstreams": {
     "deepseek":   { "anthropic_key": "sk-...", "openai_key": "sk-..." },
-    "dashscope":  { "anthropic_key": "sk-...", "openai_key": "sk-..." },
+    "xiaomi":     { "anthropic_key": "sk-...", "openai_key": "sk-..." },
     "openrouter": { "openai_key": "sk-or-..." }
   },
   "v2ray": { "host": "127.0.0.1", "port": 10809 }
@@ -96,17 +98,38 @@ curl http://127.0.0.1:9999/v1/chat/completions \
 
 按 **路径格式 × 模型名前缀** 选上游，零转换：
 
-| 请求路径 | 模型名前缀 | 上游 |
+| 模型名前缀 | 上游 | 说明 |
 |---|---|---|
-| `/v1/messages` | `glm*` | 阿里百炼（`/apps/anthropic`） |
-| `/v1/messages` | `or/*` | OpenRouter（`/api`，经 v2ray 隧道） |
-| `/v1/messages` | 其他 | DeepSeek（`/anthropic`） |
-| `/v1/chat/completions` | 同上三档 | 对应的 OpenAI 兼容端点 |
+| `or/*` | OpenRouter（`/api`，**经 v2ray 隧道出海**） | 剥掉 `or/` 前缀转给 OR；可在 OR 上测任意厂商模型 |
+| `mimo*` | 小米 MiMo（`api.xiaomimimo.com`，**直连不经隧道**） | 与 OR 同名、不加前缀；上游在途并发上限 ≈100 |
+| `glm*` | **400 拒绝** | 见下「关于 GLM」 |
+| 其他 | DeepSeek（`/anthropic`） | 默认落点 |
 
-**`or/` 前缀约定**：`or/anthropic/claude-opus-4.7` → 剥掉 `or/` 后转给 OpenRouter。
-用它可以在 OpenRouter 上测任意厂商的模型，而钥匙只存一份。
+两种格式（`/v1/messages` 与 `/v1/chat/completions`）各自拼各自的上游路径（如 DeepSeek 的 `/anthropic` vs `/v1`），**不做任何格式翻译**。
 
-> 路由表在 `broker.cjs` 顶部的 `UPSTREAMS` 常量里，改起来是几行的事。
+### `or/` 前缀约定
+
+`or/anthropic/claude-opus-4.7` → 剥掉 `or/` 后转给 OpenRouter。用它可以在 OpenRouter 上测任意厂商的模型，而钥匙只存一份。
+
+### 关于 GLM
+
+GLM 走 **OpenRouter**，用 OR 全名 + `@tag` 后缀钉供给方：
+
+```
+or/z-ai/glm-5.3@zai     # 钉智谱官方（Z.AI）
+or/z-ai/glm-5.3@ali     # 钉阿里（Alibaba）
+or/z-ai/glm-5.3         # 不带后缀 = OR 自选
+```
+
+> **为什么要 `@tag`**：同一个 `z-ai/glm-5.3` 背后 OR 上挂了几十个供给方，不钉选就乱飘（可能落到
+> 意料外的供应商）。`@zai`/`@zhipu` → `Z.AI`，`@ali`/`@alibaba` → `Alibaba`，其余 → 400。
+> 钉供给方时 broker 注入 OR 原生 `provider` 字段并设 `allow_fallbacks:false`——**钉不住就响亮报错，绝不静默换一家**。
+>
+> 裸 `glm*`（无 `or/` 前缀）现在 **400 拒绝**——旧的阿里百炼直连路已移除，请用上面的 OR 全名。
+
+### 路由表在哪
+
+`broker.cjs` 顶部的 `UPSTREAMS`（上游端点）与 `routeFor()`（前缀规则）两个常量/函数，改起来是几行的事。
 
 ---
 
@@ -120,6 +143,7 @@ curl http://127.0.0.1:9999/v1/chat/completions \
 | `--host` | `BROKER_HOST` | `127.0.0.1` | 监听地址（**强烈建议保持本地**） |
 | — | `BROKER_SECRETS_PATH` | `~/.claude/secrets.json` | 钥匙文件路径 |
 | — | `BROKER_LOG` | `./broker-<port>.log` | 日志路径 |
+| — | `BROKER_USAGE` | `./usage-<port>.jsonl` | 用量记录路径 |
 
 ### 健康检查
 
@@ -141,6 +165,33 @@ curl http://127.0.0.1:9999/healthz
 
 ---
 
+## 用量记账
+
+每个**成功完成**的转发会往 `usage-<port>.jsonl` 追加一行 JSON（`BROKER_USAGE` 可覆盖；超 32MB 轮转为 `.1`）：
+
+```json
+{"ts":"2026-10-01T13:45:16.938Z","port":9999,"route":"deepseek","reqModel":"deepseek-flash","upModel":null,"served":"deepseek-flash","kind":"A","stream":false,"status":200,"ms":688,"input":34,"output":20,"cacheRead":0,"cacheWrite":0}
+```
+
+- `kind`：`A` = Anthropic 格式，`O` = OpenAI 格式；`served` = 上游返回的模型名
+- 字段：输入 / 输出 / 缓存读 / 缓存写 token 分开计
+- **只记数字与模型名**——body / header / key 一概不记（同日志原则）；错误响应（如 `glm*` 的 400）不落记录
+- OpenAI 流式会自动注入标准的 `stream_options.include_usage=true`，让末块带上用量（唯一一处会碰请求体的地方）
+
+### 汇总脚本
+
+仓库自带一个只读的汇总脚本，按 **天 × 模型** 聚合：
+
+```bash
+node tools/token-stats.js                 # 默认读 ./usage-*.jsonl
+node tools/token-stats.js --dir <目录>     # 指定目录
+node tools/token-stats.js --days 14        # 只看最近 14 天
+node tools/token-stats.js --since 2026-10-01
+node tools/token-stats.js --json           # 输出 JSON，给别的工具/面板读
+```
+
+---
+
 ## 安全建议
 
 1. **锁本地**：默认只监听 `127.0.0.1`，不要改成 `0.0.0.0`（否则同局域网可访问）
@@ -154,7 +205,7 @@ curl http://127.0.0.1:9999/healthz
    # Unix
    chmod 600 ~/.claude/secrets.json
    ```
-4. **日志已脱敏**：broker 不记录 body / header / key，可安全保留
+4. **日志 / 用量记录已脱敏**：broker 不记录 body / header / key，可安全保留
 
 ---
 
@@ -183,7 +234,7 @@ curl http://127.0.0.1:9999/healthz
 | 脚本 | 用途 |
 |---|---|
 | `ask.js` | 换模型名就能问任意模型（顶部改 `MODEL` 和 `QUESTIONS`） |
-| `live-test-broker.js` | 四种组合冒烟：多端口 × 双格式 |
+| `live-test-broker.js` | 冒烟：多端口 × 双格式 × 各路由 |
 
 ```bash
 node examples/ask.js            # 默认走 9999

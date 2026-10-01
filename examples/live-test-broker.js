@@ -17,7 +17,8 @@ function post(port, p, headers, body) {
   const tests = [
     ['9999 A格式 DS  local-broker', 9999, '/v1/messages', { 'x-api-key': 'local-broker' }, { model: 'deepseek-flash', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
     ['9999 O格式 DS  local-broker', 9999, '/v1/chat/completions', { 'authorization': 'Bearer local-broker' }, { model: 'deepseek-flash', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
-    ['9997 A格式 glm local-broker', 9997, '/v1/messages', { 'x-api-key': 'local-broker' }, { model: 'glm-5.3', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
+    ['9997 A格式 GLM(OR) local-broker', 9997, '/v1/messages', { 'x-api-key': 'local-broker' }, { model: 'or/z-ai/glm-5.3@zai', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
+    ['9997 A格式 glm裸名 期望400', 9997, '/v1/messages', { 'x-api-key': 'local-broker' }, { model: 'glm-5.3', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
     ['9997 O格式 OR  local-broker', 9997, '/v1/chat/completions', { 'authorization': 'Bearer local-broker' }, { model: 'or/openai/gpt-4o-mini', max_tokens: 60, messages: [{ role: 'user', content: P }] }],
   ];
   for (const [name, port, p, h, b] of tests) {

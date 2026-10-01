@@ -14,14 +14,20 @@
  * 路由（零协议转换，按 路径格式 × 模型名 选上游）:
  *   POST /v1/messages          Anthropic 格式
  *   POST /v1/chat/completions  OpenAI   格式
- *   model 以 glm 开头   -> dashscope（百炼）
  *   model 以 or/ 开头   -> openrouter（经 v2ray 隧道），模型名剥去 or/
+ *                          可加 @tag 钉供给方：@zai|@zhipu -> Z.AI，@ali|@alibaba -> Alibaba
+ *   model 以 mimo 开头  -> xiaomi（小米直连，不经隧道）
+ *   model 以 glm 开头   -> 400 拒绝（旧阿里百炼路已移除，请改用 or/z-ai/glm-* 全名）
  *   其他               -> deepseek
  *
  * 客户端 key 双认:
  *   local-broker          -> 换成 secrets.json 里的真 key
  *   其他（含真 key）      -> 透传（保持切换前行为）
  *   secrets.json 读不到   -> 降级透传 + WARN，绝不 crash
+ *
+ * 用量记录:
+ *   每个已完成的转发追加一行 JSON 到 usage-<port>.jsonl（可用 BROKER_USAGE 覆盖）：
+ *   时间/上游/模型/输入输出/缓存 token/状态。只记数字与模型名，不记 body/header/key。
  */
 
 const http = require('http');
@@ -40,12 +46,19 @@ const PORT = parseInt(argValue('--port') || process.env.BROKER_PORT || '9999', 1
 const HOST = argValue('--host') || process.env.BROKER_HOST || '127.0.0.1';
 const SECRETS_PATH = process.env.BROKER_SECRETS_PATH || path.join(os.homedir(), '.claude', 'secrets.json');
 const LOG_PATH = process.env.BROKER_LOG || path.join(__dirname, 'broker-' + PORT + '.log');
+const USAGE_PATH = process.env.BROKER_USAGE || path.join(__dirname, 'usage-' + PORT + '.jsonl');
 const DEFAULT_ACCEPT_TOKEN = 'local-broker';
 
 const UPSTREAMS = {
-  deepseek:   { host: 'api.deepseek.com',       aPrefix: '/anthropic',      oPrefix: '' },
-  dashscope:  { host: 'dashscope.aliyuncs.com', aPrefix: '/apps/anthropic', oPrefix: '/compatible-mode' },
-  openrouter: { host: 'openrouter.ai',          aPrefix: '/api',            oPrefix: '/api', tunnel: true },
+  deepseek:   { host: 'api.deepseek.com',   aPrefix: '/anthropic', oPrefix: '' },
+  xiaomi:     { host: 'api.xiaomimimo.com', aPrefix: '/anthropic', oPrefix: '' },
+  openrouter: { host: 'openrouter.ai',      aPrefix: '/api',       oPrefix: '/api', tunnel: true },
+};
+
+// 模型名 @tag 后缀 -> OpenRouter 供给方名（provider.order 用）
+const PROVIDER_PINS = {
+  zai: 'Z.AI', zhipu: 'Z.AI',
+  ali: 'Alibaba', alibaba: 'Alibaba',
 };
 
 // ---------- 日志（只记时间/方法/路径/模型/状态码/耗时/上游名；不记 body、不记 header、不记 key） ----------
@@ -56,6 +69,84 @@ try { // 简易轮转：超过 5MB 时重命名为 .1
   const st = fs.statSync(LOG_PATH);
   if (st.size > 5 * 1024 * 1024) fs.renameSync(LOG_PATH, LOG_PATH + '.1');
 } catch (_) {}
+
+// ---------- 用量记录（只记数字，不记内容） ----------
+let usageWrites = 0;
+function recordUsage(rec) {
+  try {
+    fs.appendFileSync(USAGE_PATH, JSON.stringify(rec) + '\n');
+    if ((++usageWrites & 0x7f) === 0) {   // 每 ~128 次检查一次体积
+      try {
+        const st = fs.statSync(USAGE_PATH);
+        if (st.size > 32 * 1024 * 1024) fs.renameSync(USAGE_PATH, USAGE_PATH + '.1');
+      } catch (_) {}
+    }
+  } catch (_) { /* 统计失败绝不影响转发 */ }
+}
+
+// 从上游响应里抠出 token 用量。Anthropic 与 OpenAI 字段名不同，分别解析。
+// SSE 用逐行 data: 解析（末尾 message_delta / 末块 usage 才带 output）；非流式整体 JSON.parse。
+function createUsageSniffer(isAnthropic, isSSE) {
+  const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, served: null, seen: false };
+
+  function absorbAnthropic(obj) {
+    if (obj && typeof obj.model === 'string') acc.served = obj.model;
+    const u = (obj && obj.type === 'message_start' && obj.message && obj.message.usage)
+      ? obj.message.usage
+      : (obj && obj.usage);
+    if (u && typeof u === 'object') {
+      if (typeof u.input_tokens === 'number') acc.input = u.input_tokens;
+      if (typeof u.output_tokens === 'number') acc.output = Math.max(acc.output, u.output_tokens);
+      if (typeof u.cache_read_input_tokens === 'number') acc.cacheRead = u.cache_read_input_tokens;
+      if (typeof u.cache_creation_input_tokens === 'number') acc.cacheWrite = u.cache_creation_input_tokens;
+      acc.seen = true;
+    }
+  }
+  function absorbOpenAI(obj) {
+    if (obj && typeof obj.model === 'string') acc.served = obj.model;
+    const u = obj && obj.usage;
+    if (u && typeof u === 'object') {
+      if (typeof u.prompt_tokens === 'number') acc.input = u.prompt_tokens;
+      if (typeof u.completion_tokens === 'number') acc.output = u.completion_tokens;
+      const cached = u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens;
+      if (typeof cached === 'number') acc.cacheRead = cached;
+      acc.seen = true;
+    }
+  }
+  const absorb = isAnthropic ? absorbAnthropic : absorbOpenAI;
+
+  let sseBuf = '';
+  let parts = null;
+  let bytes = 0;
+
+  function feed(chunk) {
+    if (isSSE) {
+      sseBuf += chunk.toString('utf8');
+      if (sseBuf.length > 2 * 1024 * 1024) sseBuf = sseBuf.slice(-1024 * 1024);  // 上限保护
+      let nl;
+      while ((nl = sseBuf.indexOf('\n')) !== -1) {
+        let line = sseBuf.slice(0, nl).trim();
+        sseBuf = sseBuf.slice(nl + 1);
+        if (!line || line[0] === ':') continue;                 // 注释/心跳行
+        if (line.startsWith('data:')) line = line.slice(5).trim();
+        if (!line || line === '[DONE]') continue;
+        let obj; try { obj = JSON.parse(line); } catch (_) { continue; }
+        try { absorb(obj); } catch (_) {}
+      }
+    } else {
+      bytes += chunk.length;
+      if (bytes > 8 * 1024 * 1024) { parts = null; return; }    // 超大整包放弃统计
+      (parts || (parts = [])).push(chunk);
+    }
+  }
+  function finish() {
+    if (!isSSE && parts) {
+      try { absorb(JSON.parse(Buffer.concat(parts).toString('utf8'))); } catch (_) {}
+    }
+    return acc;
+  }
+  return { feed, finish, acc };
+}
 
 // ---------- secrets.json（唯一读者） ----------
 let secrets = null;          // 最近一次成功解析的内容
@@ -155,17 +246,20 @@ function sortTools(tools) {
   });
 }
 
-function normalizeGlmEffort(data) {
-  const oc = data && data.output_config;
-  if (!oc || typeof oc !== 'object' || oc.effort === undefined) return;
-  const map = { xhigh: 'max', medium: 'high' };   // 百炼只认 low/high/max
-  oc.effort = map[oc.effort] || (['low', 'high', 'max'].includes(oc.effort) ? oc.effort : 'max');
-}
-
 // ---------- 路由 ----------
 function routeFor(model) {
-  if (/^or\//i.test(model)) return { upstream: 'openrouter', model: model.slice(3) };
-  if (/^glm/i.test(model)) return { upstream: 'dashscope', model };
+  if (/^or\//i.test(model)) {
+    const rest = model.slice(3);
+    const at = rest.lastIndexOf('@');
+    if (at > 0) {
+      const tag = rest.slice(at + 1).toLowerCase();
+      const provider = PROVIDER_PINS[tag] || null;
+      return { upstream: 'openrouter', model: rest.slice(0, at), provider, badTag: provider ? null : tag };
+    }
+    return { upstream: 'openrouter', model: rest };
+  }
+  if (/^mimo/i.test(model)) return { upstream: 'xiaomi', model };
+  if (/^glm/i.test(model))  return { upstream: 'reject', model };   // 旧百炼路已移除
   return { upstream: 'deepseek', model };
 }
 
@@ -238,6 +332,17 @@ async function handle(req, res, rawBody, started) {
   const model0 = data && typeof data.model === 'string' ? data.model : '';
   const route = routeFor(model0);
 
+  // ---- 拒绝：glm*（旧百炼路已移除）/ 未知 @tag ----
+  if (route.upstream === 'reject' || route.badTag) {
+    const message = route.badTag
+      ? '未知的供给方标记 @' + route.badTag + '（可用：@zai / @zhipu / @ali / @alibaba）'
+      : 'glm* -> 阿里百炼 路由已移除。请改用 OpenRouter 全名：or/z-ai/glm-5.3（可选 @zai 钉智谱官方、@ali 钉阿里）。';
+    log('REJECT model=' + (model0 || '-') + ' :: ' + message);
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }));
+    return;
+  }
+
   // ---- Anthropic 分支：沿用 ds-proxy 的 CC 专属 hack（OpenAI 分支纯透传） ----
   if (isAnthropic && data) {
     stripReasoningControls(data);
@@ -254,7 +359,18 @@ async function handle(req, res, rawBody, started) {
       data.messages = data.messages.filter(m => m.role !== 'system');
       data.system = sysMsgs.flatMap(m => (typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content));
     }
-    if (route.upstream === 'dashscope') normalizeGlmEffort(data);
+  }
+
+  // ---- 钉供给方（OR 原生字段，两种格式通用） ----
+  if (data && route.provider) {
+    data.provider = { order: [route.provider], allow_fallbacks: false };
+  }
+
+  // ---- OpenAI 流式：注入 include_usage，让末块带上 token 用量（标准字段，不改语义） ----
+  let injectedUsage = false;
+  if (!isAnthropic && data && data.stream === true && !(data.stream_options && data.stream_options.include_usage)) {
+    data.stream_options = { ...(data.stream_options || {}), include_usage: true };
+    injectedUsage = true;
   }
 
   // ---- 需要改 model 名的场景（or/ 前缀剥除） ----
@@ -262,8 +378,8 @@ async function handle(req, res, rawBody, started) {
   if (isAnthropic) {
     if (data && route.model !== model0) data.model = route.model;
     outBody = data ? Buffer.from(JSON.stringify(data)) : rawBody;
-  } else if (data && route.model !== model0) {
-    data.model = route.model;
+  } else if (data && (route.model !== model0 || injectedUsage)) {
+    if (route.model !== model0) data.model = route.model;
     outBody = Buffer.from(JSON.stringify(data));
   } else {
     outBody = rawBody;   // OpenAI 分支非 or/ ：逐字节透传
@@ -284,22 +400,14 @@ async function handle(req, res, rawBody, started) {
 
   const upstreamKey = keyFor(route.upstream, isAnthropic ? 'anthropic' : 'openai');
   let keySource = 'passthrough';
-  if (route.upstream === 'dashscope') {
-    // 百炼：客户端不可能持有该 key，始终由 broker 注入（沿用旧 ds-proxy 行为）
-    if (upstreamKey) {
-      if (isAnthropic) headers['x-api-key'] = upstreamKey; else headers['authorization'] = 'Bearer ' + upstreamKey;
-      keySource = 'broker';
-    } else {
-      keySource = 'degraded';
-    }
-  } else if (route.upstream === 'openrouter') {
+  if (route.upstream === 'openrouter') {
     if (upstreamKey && (!hadX || xPlaceholder) && (!hadAuth || aPlaceholder)) {
       headers['authorization'] = 'Bearer ' + upstreamKey;    // 客户端没带真凭证 -> 注入
       keySource = 'broker';
     } else if (aPlaceholder || xPlaceholder || (!hadX && !hadAuth && !upstreamKey)) {
       keySource = 'degraded';
     }
-  } else { // deepseek：双认
+  } else { // deepseek / xiaomi：双认
     if (xPlaceholder || aPlaceholder || (!hadX && !hadAuth)) {
       if (upstreamKey) {
         if (aPlaceholder || (!hadX && !hadAuth && !isAnthropic)) headers['authorization'] = 'Bearer ' + upstreamKey;
@@ -324,6 +432,31 @@ async function handle(req, res, rawBody, started) {
     const responseHeaders = { ...proxyRes.headers };
     delete responseHeaders['transfer-encoding'];
     log('RESP ' + proxyRes.statusCode + ' ' + (Date.now() - started) + 'ms route=' + route.upstream + ' key=' + keySource);
+
+    // 用量嗅探：只旁听响应体（tee），不动转发
+    const ct = String(proxyRes.headers['content-type'] || '');
+    const isSSE = ct.includes('text/event-stream');
+    const sniffer = createUsageSniffer(isAnthropic, isSSE);
+    proxyRes.on('data', (c) => { try { sniffer.feed(c); } catch (_) {} });
+    proxyRes.on('end', () => {
+      let u = null; try { u = sniffer.finish(); } catch (_) {}
+      if (u && u.seen) {
+        recordUsage({
+          ts: new Date().toISOString(),
+          port: PORT,
+          route: route.upstream,
+          reqModel: model0 || null,
+          upModel: (route.model && route.model !== model0) ? route.model : null,
+          served: u.served || null,
+          kind: isAnthropic ? 'A' : 'O',
+          stream: isSSE,
+          status: proxyRes.statusCode,
+          ms: Date.now() - started,
+          input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+        });
+      }
+    });
+
     try { if (!res.headersSent) res.writeHead(proxyRes.statusCode, responseHeaders); } catch (_) {}
     proxyRes.pipe(res);
   };
@@ -370,6 +503,6 @@ process.on('unhandledRejection', reason => {
 srv.requestTimeout = 0;   // 长思考/长流式响应不能被默认 5 分钟掐断
 srv.listen(PORT, HOST, () => {
   const s = getSecrets();
-  log('STARTED on ' + HOST + ':' + PORT + ' secrets=' + (s ? 'ok' : 'DEGRADED-passthrough'));
+  log('STARTED on ' + HOST + ':' + PORT + ' secrets=' + (s ? 'ok' : 'DEGRADED-passthrough') + ' usage=' + USAGE_PATH);
   console.log('credential broker on http://' + HOST + ':' + PORT + (s ? '' : '  [DEGRADED: secrets.json unavailable]'));
 });
